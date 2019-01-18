@@ -1595,8 +1595,13 @@ public class FMRadioService extends Service
                           break;
                       }
 
-                      if(false == mPlaybackInProgress)
+                      if(false == mPlaybackInProgress) {
                           startFM();
+                          if (mReceiver.isCherokeeChip() &&
+                                (mPref.getBoolean("SLIMBUS_SEQ", true))) {
+                              enableSlimbus(ENABLE_SLIMBUS_DATA_PORT);
+                          }
+                      }
                       mSession.setActive(true);
                       break;
                   default:
@@ -2364,6 +2369,9 @@ public class FMRadioService extends Service
          else
          {
            if (mReceiver.isCherokeeChip()) {
+               if (mPref.getBoolean("SLIMBUS_SEQ", true)) {
+                   enableSlimbus(ENABLE_SLIMBUS_DATA_PORT);
+               }
                bStatus = fmTurnOnSequenceCherokee();
            } else {
                bStatus = fmTurnOnSequence();
@@ -2384,10 +2392,6 @@ public class FMRadioService extends Service
       if(audioManager != null)
       {
          Log.d(LOGTAG, "audioManager.setFmRadioOn = false \n" );
-         if ((mReceiver != null) && mReceiver.isCherokeeChip() &&
-                     (mPref.getBoolean("SLIMBUS_SEQ", true))) {
-              enableSlimbus(DISABLE_SLIMBUS_DATA_PORT);
-         }
          stopFM();
          unMute();
          // If call is active, we will use audio focus to resume fm after call ends.
@@ -3994,6 +3998,9 @@ public class FMRadioService extends Service
            audioManager.requestAudioFocus(mAudioFocusListener, AudioManager.STREAM_MUSIC,
                   AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
            startFM();
+           if (mReceiver.isCherokeeChip() && (mPref.getBoolean("SLIMBUS_SEQ", true))) {
+              enableSlimbus(ENABLE_SLIMBUS_DATA_PORT);
+           }
            mStoppedOnFocusLoss = false;
        }
    }
