@@ -59,9 +59,12 @@ static uint32_t station_dbg_param_mask_flag;
 uint64_t flag;
 static int slimbus_flag = 0;
 struct fm_hal_t *hal = NULL;
+static pthread_mutex_t hal_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hal_cond = PTHREAD_COND_INITIALIZER;
 
 #define LOG_TAG "radio_helium"
 #define WAIT_TIMEOUT 20000 /* 20*1000us */
+#define HAL_TIMEOUT  3
 
 static void radio_hci_req_complete(char result)
 {
@@ -418,8 +421,8 @@ static void hci_cc_station_rsp(char *ev_buff)
     }
     ALOGE("hci_cc_station_rsp: val =%x, status = %x", val, status);
 
-    hal->jni_cb->fm_get_station_param_cb(val, status);
     clear_all_bit(station_param_mask_flag);
+    hal->jni_cb->fm_get_station_param_cb(val, status);
 }
 
 static void hci_cc_dbg_param_rsp(char *ev_buff)
@@ -479,11 +482,10 @@ static inline void hci_cmd_complete_event(char *buff)
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_DISABLE_RECV_REQ):
             hci_cc_fm_disable_rsp(pbuf);
             break;
-
-    case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_RECV_CONF_REQ):
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_MUTE_MODE_REQ):
             hci_cc_enable_softmute_rsp(pbuf);
             break; 
+    case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_RECV_CONF_REQ):
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_STEREO_MODE_REQ):
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_ANTENNA):
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_SIGNAL_THRESHOLD):
@@ -1100,6 +1102,7 @@ int fm_hci_close_done()
     ALOGI("fm_hci_close_done");
     fm_hal_callbacks_t *ptr = NULL;
 
+    pthread_mutex_lock(&hal_lock);
     if(hal != NULL){
         ptr = hal->jni_cb;
         ALOGI("clearing hal ");
@@ -1115,6 +1118,8 @@ int fm_hci_close_done()
         ptr->disabled_cb();
         ptr->thread_evt_cb(1);
     }
+    pthread_cond_broadcast(&hal_cond);
+    pthread_mutex_unlock(&hal_lock);
     return 0;
 }
 
@@ -1277,27 +1282,31 @@ int hal_init(fm_hal_callbacks_t *cb)
 {
     int ret = -FM_HC_STATUS_FAIL, i;
     fm_hci_hal_t hci_hal;
+    struct timespec ts;
 
     ALOGD("++%s", __func__);
 
     memset(&hci_hal, 0, sizeof(fm_hci_hal_t));
 
-    if (hal) {
-        ALOGE("%s:HAL is still available from the last session, please wait for sometime", __func__);
-        for(i=0; i<10; i++) {
-            if (!hal) {
-                break;
+    pthread_mutex_lock(&(hal_lock));
+    while (hal) {
+        ALOGE("%s:HAL is still available wait for last hal session to close", __func__);
+        if ((ret = clock_gettime(CLOCK_REALTIME, &ts)) == 0) {
+            ts.tv_sec += HAL_TIMEOUT;
+            ret = pthread_cond_timedwait(&hal_cond, &hal_lock,
+                    &ts);
+            if(ret == ETIMEDOUT) {
+                ALOGE("%s:FM Hci close is stuck kiiling the fm process", __func__);
+                kill(getpid(), SIGKILL);
             } else {
-                usleep(WAIT_TIMEOUT);
+                ALOGD("%s:last HAL session is closed ", LOG_TAG);
             }
+        } else {
+            ALOGE("%s: clock gettime failed. err = %d(%s)", LOG_TAG,
+                    errno, strerror(errno));
         }
     }
-
-    if (hal) {
-        ALOGE("%s:Last FM session didnot end properly, please launch again", __func__);
-        hal = NULL;
-        return ret;
-    }
+    pthread_mutex_unlock(&hal_lock);
 
     hal = malloc(sizeof(struct fm_hal_t));
     if (!hal) {
@@ -1360,9 +1369,11 @@ static int set_fm_ctrl(int cmd, int val)
     struct hci_fm_def_data_wr_req def_data_wrt;
     struct hci_fm_def_data_rd_req def_data_rd;
 
+    pthread_mutex_lock(&hal_lock);
     if (!hal) {
         ALOGE("%s:ALERT: command sent before hal init", __func__);
-        return -FM_HC_STATUS_FAIL;
+        ret = -FM_HC_STATUS_FAIL;
+        goto end;
     }
     ALOGD("%s:cmd: %x, val: %d",LOG_TAG, cmd, val);
 
@@ -1947,6 +1958,7 @@ static int set_fm_ctrl(int cmd, int val)
 end:
     if (ret < 0)
         ALOGE("%s:%s: 0x%x cmd failed", LOG_TAG, __func__, cmd);
+    pthread_mutex_unlock(&hal_lock);
     return ret;
 }
 
@@ -1955,31 +1967,33 @@ static int get_fm_ctrl(int cmd, int *val)
     int ret = 0;
     struct hci_fm_def_data_rd_req def_data_rd;
 
+    pthread_mutex_lock(&hal_lock);
     if (!hal) {
         ALOGE("%s:ALERT: command sent before hal_init", __func__);
-        return -FM_HC_STATUS_FAIL;
+        ret = -FM_HC_STATUS_FAIL;
+        goto end;
     }
 
     ALOGE("%s: cmd = 0x%x", __func__, cmd);
     switch(cmd) {
     case HCI_FM_HELIUM_FREQ:
         if (!val)
-            return -FM_HC_STATUS_NULL_POINTER;
+            ret = -FM_HC_STATUS_NULL_POINTER;
         *val = hal->radio->fm_st_rsp.station_rsp.station_freq;
         break;
     case HCI_FM_HELIUM_UPPER_BAND:
         if (!val)
-            return -FM_HC_STATUS_NULL_POINTER;
+            ret = -FM_HC_STATUS_NULL_POINTER;
         *val = hal->radio->recv_conf.band_high_limit;
         break;
     case HCI_FM_HELIUM_LOWER_BAND:
         if (!val)
-            return -FM_HC_STATUS_NULL_POINTER;
+            ret = -FM_HC_STATUS_NULL_POINTER;
         *val = hal->radio->recv_conf.band_low_limit;
         break;
     case HCI_FM_HELIUM_AUDIO_MUTE:
         if (!val)
-            return -FM_HC_STATUS_NULL_POINTER;
+            ret = -FM_HC_STATUS_NULL_POINTER;
         *val = hal->radio->mute_mode.hard_mute;
         break;
     case HCI_FM_HELIUM_SINR_SAMPLES:
@@ -2123,8 +2137,11 @@ cmd:
     default:
         break;
     }
+
+end:
     if (ret < 0)
         ALOGE("%s:%s: %d cmd failed", LOG_TAG, __func__, cmd);
+    pthread_mutex_unlock(&hal_lock);
     return ret;
 }
 
